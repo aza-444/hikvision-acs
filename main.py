@@ -53,36 +53,22 @@ class HelpDialog(QDialog):
         
         <hr style="border: 1px solid #334155;"/>
 
-        <h3 style="color: #34d399;">1️⃣ Turniketni dasturga qanday ulayman?</h3>
+        <h3 style="color: #34d399;">1️⃣ Turniket Offline bo'lib qolsa nima qilish kerak?</h3>
         <ul>
-            <li>Chap menyudagi <b>⚙️ Sozlamalar</b> bo'limiga kiring.</li>
-            <li><b>"🔍 Tarmoqdan avtomatik qidirish (SADP)"</b> tugmasini bosing. Dastur kompyuteringiz ulangan tarmoqdagi barcha Hikvision turniketlarini o'zi topadi.</li>
-            <li>Turniket parolini kiritib, <b>"Saqlash"</b> tugmasini bosing.</li>
+            <li><b>⚙️ Sozlamalar -> 🖥️ Qurilmalar</b> bo'limiga kiring.</li>
+            <li>Turniket qatoridagi <b>"🔗 Tekshirish"</b> tugmasini bosing. Dastur sizga ulanish nimaga bo'lmayotganini (Parol xatomi, IP manzili ochilmayaptimi) aytib beradi.</li>
+            <li>Kompyuteringiz va turniket bir xil Wi-Fi router yoki switchga ulanganligiga ishonch hosil qiling.</li>
         </ul>
 
-        <h3 style="color: #34d399;">2️⃣ Kirish-chiqish xabarlarini Telegramga qanday ulayman?</h3>
+        <h3 style="color: #34d399;">2️⃣ Kirish-chiqish xabarlarini Telegramga ulash:</h3>
         <ul>
-            <li>Telegramda <b>@BotFather</b> botiga kirib, <code>/newbot</code> orqali yangi bot yarating va <b>Token</b> oling.</li>
-            <li>Dasturda <b>⚙️ Sozlamalar -> ✈️ Telegram Bot</b> bo'limiga o'ting.</li>
-            <li>Katakchani yoqing, Token va o'z Telegram ID raqamingizni (yoki guruh ID) kiriting.</li>
-            <li><b>"📩 Botga sinov xabari yuborish"</b> tugmasi orqali tekshiring. Endi har bir o'tish Telegramga real-time boradi!</li>
+            <li>Telegramda <b>@BotFather</b> orqali yangi bot yarating va <b>Token</b> oling.</li>
+            <li>Dasturda <b>⚙️ Sozlamalar -> ✈️ Telegram Bot</b> bo'limiga kirib, Token va Chat ID ni kiriting.</li>
         </ul>
 
-        <h3 style="color: #34d399;">3️⃣ Xodimlarni qanday ro'yxatga olaman?</h3>
+        <h3 style="color: #34d399;">3️⃣ Xodimlarni ro'yxatga olish:</h3>
         <ul>
-            <li><b>👥 Xodimlar</b> bo'limiga kiring va <b>"➕ Yangi xodim"</b> tugmasini bosing.</li>
-            <li>Ism, familiya, bo'lim va xodimga berilgan karta raqamini kiriting.</li>
-        </ul>
-
-        <h3 style="color: #34d399;">4️⃣ Oylik hisobot va Excel tabel qayerda?</h3>
-        <ul>
-            <li><b>📈 Hisobotlar</b> bo'limiga kiring.</li>
-            <li>Kerakli sana oralig'ini tanlab, <b>"📥 Excel"</b> tugmasini bosing. Barcha kelgan-ketgan vaqtlar va ishlagan soatlar chiroyli Excel faylga tushadi.</li>
-        </ul>
-
-        <h3 style="color: #f87171;">5️⃣ Turniketni shoshilinch ochish kerak bo'lsa:</h3>
-        <ul>
-            <li>Chap tomonda yashil <b>"🔓 Turniketni ochish"</b> tugmasi bor. Uni bossangiz, turniket darhol masofadan ochiladi.</li>
+            <li><b>👥 Xodimlar</b> bo'limiga kiring va <b>"➕ Yangi xodim"</b> orqali ism, familiya va karta raqamini kiriting.</li>
         </ul>
         """)
         layout.addWidget(browser)
@@ -104,11 +90,21 @@ class DeviceSyncManager(QObject):
         self.running = True
 
     def start(self):
+        self.stop_all()
         devices = get_all_devices()
         for dev in devices:
             self._start_worker(dev)
 
+    def stop_all(self):
+        for p in self.pollers:
+            try:
+                p.stop()
+            except Exception:
+                pass
+        self.pollers.clear()
+
     def _start_worker(self, dev):
+        dev_id = dev["id"]
         hk = HikvisionDevice(dev["ip_address"], dev["port"], dev["username"], dev["password"])
 
         def on_event_callback(parsed_event):
@@ -144,7 +140,13 @@ class DeviceSyncManager(QObject):
             self.event_received.emit(record)
             TelegramNotifier.notify_access_event(record)
 
-        poller = EventPoller(hk, on_event_callback, interval=4)
+        def on_status_callback(did, is_online):
+            # Bazani yangilash
+            update_device_status(did, is_online)
+            # UI ga xabar berish
+            self.device_status_changed.emit(did, is_online)
+
+        poller = EventPoller(hk, dev_id, on_event_callback, on_status_callback, interval=3)
         poller.start()
         self.pollers.append(poller)
 
@@ -161,6 +163,7 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self.dashboard_page.load_today_events()
 
+        # Monitoring menejeri
         self.sync_manager = DeviceSyncManager()
         self.sync_manager.event_received.connect(self._on_live_event)
         self.sync_manager.device_status_changed.connect(self._on_device_status)
@@ -233,13 +236,11 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch()
 
-        # Yordam tugmasi
         btn_help = QPushButton("  ❓  Yordam / Qo'llanma")
         btn_help.setObjectName("btnOutline")
         btn_help.clicked.connect(self._show_help)
         sidebar_layout.addWidget(btn_help)
 
-        # Turniketni ochish tugmasi
         btn_open_turnstile = QPushButton("🔓 Turniketni ochish")
         btn_open_turnstile.setObjectName("btnSuccess")
         btn_open_turnstile.setToolTip("Turniketni darhol masofadan ochish")
@@ -285,6 +286,9 @@ class MainWindow(QMainWindow):
             self.employees_page.refresh_table()
         elif index == 2:
             self.events_page._load_events()
+        elif index == 4:
+            # Sozlamalardan qaytganda workerlarni yangilash
+            self.sync_manager.start()
 
     def _show_help(self):
         dlg = HelpDialog(self)
@@ -302,7 +306,7 @@ class MainWindow(QMainWindow):
     def _remote_open_turnstile(self):
         devices = get_all_devices()
         if not devices:
-            QMessageBox.warning(self, "Qurilma topilmadi", "Hozirda birorta ham turniket qo'shilmagan!\nSozlamalar bo'limidan turniketni ulang.")
+            QMessageBox.warning(self, "Qurilma topilmadi", "Hozirda birorta ham turniket qo'shilmagan!")
             return
 
         success_count = 0

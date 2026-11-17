@@ -1,46 +1,70 @@
 """
 Hikvision ISAPI xizmati - Turniket va terminallar bilan universal bog'lanish
-Hikvision DS-K1Txxx, DS-K2600, MinMoe, Face Recognition va barcha ISAPI turniketlari uchun moslashtirilgan.
+HTTP va HTTPS ni avtomatik aniqlaydi, barcha Hikvision qurilmalari bilan barqaror ishlaydi.
 """
 import requests
-from requests.auth import HTTPDigestAuth
+from requests.auth import HTTPDigestAuth, HTTPBasicAuth
 import xmltodict
 import json
 import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Callable
+import urllib3
+
+# HTTPS sertifikat ogohlantirishlarini o'chirish
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class HikvisionDevice:
     """Hikvision qurilmasi bilan universal aloqa klassi"""
 
     def __init__(self, ip: str, port: int = 80, username: str = "admin", password: str = ""):
-        self.ip = ip
-        self.port = port
-        self.username = username
+        self.ip = ip.strip()
+        self.port = int(port) if port else 80
+        self.username = username.strip()
         self.password = password
-        self.base_url = f"http://{ip}:{port}"
-        self.auth = HTTPDigestAuth(username, password)
+        self.protocol = "https" if self.port == 443 else "http"
+        self.base_url = f"{self.protocol}://{self.ip}:{self.port}"
+        self.auth = HTTPDigestAuth(self.username, self.password)
         self.session = requests.Session()
         self.session.auth = self.auth
-        self.timeout = 8
+        self.session.verify = False  # O'z-o'zidan imzolangan sertifikatlarga ruxsat berish
+        self.timeout = 5
         self.is_connected = False
+        self.last_error = ""
 
     def _request(self, method: str, path: str, data=None, headers=None, timeout=None):
-        """Universal ISAPI so'rovi (XML va JSON javoblarni qo'llab-quvvatlaydi)"""
-        url = f"{self.base_url}{path}"
+        """Universal ISAPI so'rovi (HTTP va HTTPS avto-almashtirish bilan)"""
         t = timeout or self.timeout
         h = headers or {}
+
+        # 1-urinish: standart protocol bilan
+        res = self._do_http_request(self.protocol, method, path, data, h, t)
+        if res and "error" not in res:
+            return res
+
+        # Agar HTTP da ulanib bo'lmasa, HTTPS orqali tekshirish
+        alt_protocol = "https" if self.protocol == "http" else "http"
+        res_alt = self._do_http_request(alt_protocol, method, path, data, h, t)
+        if res_alt and "error" not in res_alt:
+            self.protocol = alt_protocol
+            self.base_url = f"{self.protocol}://{self.ip}:{self.port}"
+            return res_alt
+
+        return res
+
+    def _do_http_request(self, proto: str, method: str, path: str, data, headers, timeout):
+        url = f"{proto}://{self.ip}:{self.port}{path}"
         try:
             if method.upper() == "GET":
-                resp = self.session.get(url, headers=h, timeout=t)
+                resp = self.session.get(url, headers=headers, timeout=timeout)
             elif method.upper() == "PUT":
-                resp = self.session.put(url, data=data, headers=h, timeout=t)
+                resp = self.session.put(url, data=data, headers=headers, timeout=timeout)
             elif method.upper() == "POST":
-                resp = self.session.post(url, data=data, headers=h, timeout=t)
+                resp = self.session.post(url, data=data, headers=headers, timeout=timeout)
             elif method.upper() == "DELETE":
-                resp = self.session.delete(url, headers=h, timeout=t)
+                resp = self.session.delete(url, headers=headers, timeout=timeout)
             else:
                 return None
 
@@ -58,27 +82,55 @@ class HikvisionDevice:
                         return json.loads(resp.text)
                     except Exception:
                         return {"raw": resp.text}
+            elif resp.status_code == 401:
+                # Basic Auth bilan sinab ko'rish (ba'zi eski firmwareda)
+                basic_resp = requests.request(
+                    method, url, data=data, headers=headers,
+                    auth=HTTPBasicAuth(self.username, self.password),
+                    timeout=timeout, verify=False
+                )
+                if basic_resp.status_code in (200, 201):
+                    self.session.auth = HTTPBasicAuth(self.username, self.password)
+                    try:
+                        return xmltodict.parse(basic_resp.content)
+                    except Exception:
+                        return {"raw": basic_resp.text}
+                self.last_error = "Parol yoki login xato! (HTTP 401 Unauthorized)"
+                return {"error": "HTTP 401", "detail": "Parol yoki login noto'g'ri"}
+            elif resp.status_code == 403:
+                self.last_error = "Ruxsat berilmadi (HTTP 403 Forbidden - ISAPI o'chirilgan bo'lishi mumkin)"
+                return {"error": "HTTP 403", "detail": self.last_error}
             else:
+                self.last_error = f"HTTP xatosi: {resp.status_code}"
                 return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
-        except requests.exceptions.Timeout:
-            return {"error": "Ulanish vaqti tugadi (Timeout)"}
-        except requests.exceptions.ConnectionError:
-            return {"error": f"Qurilmaga ulanib bo'lmadi: {self.ip}:{self.port}"}
+        except requests.exceptions.ConnectTimeout:
+            self.last_error = f"IP ga ulanib bo'lmadi ({self.ip}:{self.port}) - Timeout! Tarmoqni tekshiring."
+            return {"error": "Timeout"}
+        except requests.exceptions.ConnectionError as ce:
+            self.last_error = f"Aloqa uzilgan yoki port yopiq ({self.ip}:{self.port})"
+            return {"error": "ConnectionError"}
         except Exception as e:
+            self.last_error = str(e)
             return {"error": str(e)}
 
     # ============================================================
-    # Qurilma ma'lumotlari
+    # Qurilma ma'lumotlari va diagnostika
     # ============================================================
 
-    def check_connection(self) -> bool:
-        """Qurilma bilan aloqani tekshirish"""
+    def check_connection(self) -> tuple[bool, str]:
+        """Qurilma bilan aloqani tekshirish va batafsil natija qaytarish"""
         res = self._request("GET", "/ISAPI/System/deviceInfo")
-        self.is_connected = res is not None and "error" not in res
-        return self.is_connected
+        if res and "error" not in res:
+            self.is_connected = True
+            dev_info = res.get("DeviceInfo", {}) if isinstance(res, dict) else {}
+            name = dev_info.get("deviceName", "Hikvision")
+            model = dev_info.get("model", "")
+            return True, f"Ulandi! Model: {model or name}"
+        else:
+            self.is_connected = False
+            return False, self.last_error or "Qurilmaga ulanib bo'lmadi"
 
     def get_device_info(self) -> dict:
-        """Qurilma ma'lumotlarini olish (Model, Seriya, Firmware)"""
         return self._request("GET", "/ISAPI/System/deviceInfo")
 
     # ============================================================
@@ -192,21 +244,13 @@ class HikvisionDevice:
         return self._request("PUT", f"/ISAPI/AccessControl/RemoteControl/door/{door_no}",
                              data=xml, headers={"Content-Type": "application/xml"})
 
-    def always_open(self, door_no: int = 1) -> dict:
-        xml = """<?xml version="1.0" encoding="UTF-8"?>
-        <RemoteControlDoor version="2.0">
-            <cmd>alwaysOpen</cmd>
-        </RemoteControlDoor>"""
-        return self._request("PUT", f"/ISAPI/AccessControl/RemoteControl/door/{door_no}",
-                             data=xml, headers={"Content-Type": "application/xml"})
-
     # ============================================================
     # Kirish-chiqish voqealarini olish (Events)
     # ============================================================
 
     def get_access_events(self, start_time: str = "", end_time: str = "", max_results: int = 30) -> dict:
         if not start_time:
-            start_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
+            start_time = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S")
         if not end_time:
             end_time = datetime.now().strftime("%Y-%m-%dT23:59:59")
 
@@ -245,7 +289,7 @@ class HikvisionDevice:
         return self.get_access_events(start_time=start, end_time=end, max_results=count)
 
     # ============================================================
-    # Real-time AlertStream (Instant kechikishsiz oqim)
+    # Real-time AlertStream
     # ============================================================
 
     def listen_alert_stream(self, callback: Callable, stop_event: threading.Event):
@@ -286,17 +330,21 @@ class HikvisionDevice:
 
 
 class EventPoller(threading.Thread):
-    """Real-time monitoring oqimi (AlertStream + Polling zaxira)"""
+    """Real-time monitoring oqimi va Online/Offline tekshiruvchisi"""
 
-    def __init__(self, device: HikvisionDevice, callback: Callable, interval: int = 4):
+    def __init__(self, device: HikvisionDevice, device_id: int, on_event: Callable, on_status_change: Callable, interval: int = 3):
         super().__init__(daemon=True)
         self.device = device
-        self.callback = callback
+        self.device_id = device_id
+        self.on_event = on_event
+        self.on_status_change = on_status_change
         self.interval = interval
         self._stop_event = threading.Event()
         self.last_handled_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.is_online = False
 
     def run(self):
+        # 1. AlertStream ulanish
         stream_thread = threading.Thread(
             target=self.device.listen_alert_stream,
             args=(self._on_stream_alert, self._stop_event),
@@ -304,22 +352,32 @@ class EventPoller(threading.Thread):
         )
         stream_thread.start()
 
+        # 2. Polling va Online holatini yangilab turish
         while not self._stop_event.is_set():
             try:
-                events = self.device.get_latest_events(count=20)
-                if events and "error" not in events:
-                    self._process_poll_events(events)
+                ok, msg = self.device.check_connection()
+                if ok != self.is_online:
+                    self.is_online = ok
+                    self.on_status_change(self.device_id, ok)
+
+                if self.is_online:
+                    events = self.device.get_latest_events(count=20)
+                    if events and "error" not in events:
+                        self._process_poll_events(events)
             except Exception:
-                pass
+                if self.is_online:
+                    self.is_online = False
+                    self.on_status_change(self.device_id, False)
+
             self._stop_event.wait(self.interval)
 
     def _on_stream_alert(self, alert_data):
         try:
             event = self._parse_generic_event(alert_data)
             if event:
-                self.callback(event)
-        except Exception as e:
-            print(f"[AlertStream Parse Error]: {e}")
+                self.on_event(event)
+        except Exception:
+            pass
 
     def _process_poll_events(self, events_data):
         try:
@@ -340,7 +398,7 @@ class EventPoller(threading.Thread):
                     parsed = self._parse_generic_event(item)
                     if parsed:
                         self.last_handled_time = t_str
-                        self.callback(parsed)
+                        self.on_event(parsed)
         except Exception:
             pass
 
