@@ -225,6 +225,159 @@ class HikvisionDevice:
         )
 
     # ============================================================
+    # Turniketdan Xodimlar va Kartalarni Import Qilish
+    # ============================================================
+
+    def get_users_list(self, max_count: int = 500) -> list[dict]:
+        """Qurilmadagi barcha ro'yxatdan o'tgan foydalanuvchilar (xodimlar) ro'yxati"""
+        users = []
+        pos = 0
+        step = 50
+
+        while pos < max_count:
+            req_data = {
+                "UserInfoSearchCond": {
+                    "searchID": "1",
+                    "searchResultPosition": pos,
+                    "maxResults": step
+                }
+            }
+            res = self._request(
+                "POST",
+                "/ISAPI/AccessControl/UserInfo/Search?format=json",
+                data=json.dumps(req_data),
+                headers={"Content-Type": "application/json"}
+            )
+
+            if not res or "error" in res:
+                xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+                <UserInfoSearchCond version="2.0">
+                    <searchID>1</searchID>
+                    <searchResultPosition>{pos}</searchResultPosition>
+                    <maxResults>{step}</maxResults>
+                </UserInfoSearchCond>"""
+                res = self._request("POST", "/ISAPI/AccessControl/UserInfo/Search", data=xml,
+                                    headers={"Content-Type": "application/xml"})
+
+            batch = []
+            if isinstance(res, dict):
+                search_res = res.get("UserInfoSearch", {}) or res.get("UserInfoSearchResult", {})
+                if search_res:
+                    user_info = search_res.get("UserInfo", [])
+                    batch = [user_info] if isinstance(user_info, dict) else user_info
+
+            if not batch:
+                break
+
+            for u in batch:
+                emp_no = str(u.get("employeeNo", "")).strip()
+                name = str(u.get("name", "")).strip()
+                if emp_no:
+                    users.append({
+                        "employee_no": emp_no,
+                        "name": name,
+                        "user_type": u.get("userType", "normal")
+                    })
+
+            pos += len(batch)
+            if len(batch) < step:
+                break
+
+        return users
+
+    def get_cards_list(self, max_count: int = 500) -> dict[str, str]:
+        """Qurilmadagi barcha kartalar ro'yxati (employeeNo -> cardNo)"""
+        cards = {}
+        pos = 0
+        step = 50
+
+        while pos < max_count:
+            req_data = {
+                "CardInfoSearchCond": {
+                    "searchID": "1",
+                    "searchResultPosition": pos,
+                    "maxResults": step
+                }
+            }
+            res = self._request(
+                "POST",
+                "/ISAPI/AccessControl/CardInfo/Search?format=json",
+                data=json.dumps(req_data),
+                headers={"Content-Type": "application/json"}
+            )
+
+            if not res or "error" in res:
+                xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+                <CardInfoSearchCond version="2.0">
+                    <searchID>1</searchID>
+                    <searchResultPosition>{pos}</searchResultPosition>
+                    <maxResults>{step}</maxResults>
+                </CardInfoSearchCond>"""
+                res = self._request("POST", "/ISAPI/AccessControl/CardInfo/Search", data=xml,
+                                    headers={"Content-Type": "application/xml"})
+
+            batch = []
+            if isinstance(res, dict):
+                search_res = res.get("CardInfoSearch", {}) or res.get("CardInfoSearchResult", {})
+                if search_res:
+                    card_info = search_res.get("CardInfo", [])
+                    batch = [card_info] if isinstance(card_info, dict) else card_info
+
+            if not batch:
+                break
+
+            for c in batch:
+                emp_no = str(c.get("employeeNo", "")).strip()
+                card_no = str(c.get("cardNo", "")).strip()
+                if emp_no and card_no:
+                    cards[emp_no] = card_no
+
+            pos += len(batch)
+            if len(batch) < step:
+                break
+
+        return cards
+
+    def fetch_all_employees_with_cards(self, progress_callback=None) -> list[dict]:
+        """Turniketdan xodimlar va ularga biriktirilgan kartalarni birlashtirib yuklash"""
+        if progress_callback:
+            progress_callback(10, "Turniketdan kartalar ro'yxati olinmoqda...")
+        card_map = self.get_cards_list()
+
+        if progress_callback:
+            progress_callback(35, "Turniketdan xodimlar ma'lumotlari yuklanmoqda...")
+        users = self.get_users_list()
+
+        results = []
+        total = len(users)
+        for i, u in enumerate(users):
+            full_name = u["name"].strip()
+            parts = full_name.split(None, 1)
+            first_name = parts[0] if parts else f"Xodim_{u['employee_no']}"
+            last_name = parts[1] if len(parts) > 1 else ""
+
+            emp_no = u["employee_no"]
+            card_no = card_map.get(emp_no, "")
+
+            results.append({
+                "employee_no": emp_no,
+                "first_name": first_name,
+                "last_name": last_name,
+                "department": "Umumiy",
+                "position": "Xodim",
+                "phone": "",
+                "email": "",
+                "card_no": card_no,
+                "photo_path": ""
+            })
+
+            if progress_callback and total > 0:
+                pct = 40 + int(((i + 1) / total) * 55)
+                progress_callback(pct, f"Yuklandi: {i+1}/{total} - {first_name} {last_name}")
+
+        return results
+
+    # ============================================================
     # Turniketni Masofadan Boshqarish (Remote Control)
     # ============================================================
 

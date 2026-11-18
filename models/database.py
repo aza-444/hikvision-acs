@@ -224,6 +224,45 @@ def update_employee(employee_id, data: dict):
     conn.close()
 
 
+def upsert_employee_from_device(data: dict) -> tuple[int, bool]:
+    """
+    Turniketdan import qilingan xodimni bazaga kiritish yoki yangilash.
+    Qaytaradi: (employee_id, is_new: bool)
+    """
+    conn = get_connection()
+    emp_no = str(data.get("employee_no", "")).strip()
+    if not emp_no:
+        conn.close()
+        return 0, False
+
+    row = conn.execute("SELECT id, first_name, last_name, card_no, department FROM employees WHERE employee_no=?", (emp_no,)).fetchone()
+    if row:
+        emp_id = row["id"]
+        new_card = data.get("card_no") or row["card_no"]
+        new_first = data.get("first_name") or row["first_name"]
+        new_last = data.get("last_name") or row["last_name"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        conn.execute("""
+            UPDATE employees SET
+                first_name=?, last_name=?, card_no=?, is_active=1, updated_at=?
+            WHERE id=?
+        """, (new_first, new_last, new_card, now, emp_id))
+        conn.commit()
+        conn.close()
+        return emp_id, False
+    else:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO employees (employee_no, first_name, last_name, department, position, phone, email, card_no, photo_path)
+            VALUES (:employee_no, :first_name, :last_name, :department, :position, :phone, :email, :card_no, :photo_path)
+        """, data)
+        conn.commit()
+        emp_id = cursor.lastrowid
+        conn.close()
+        return emp_id, True
+
+
 def delete_employee(employee_id):
     conn = get_connection()
     conn.execute("UPDATE employees SET is_active=0 WHERE id=?", (employee_id,))
